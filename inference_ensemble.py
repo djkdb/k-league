@@ -12,14 +12,7 @@ from src.model import ImprovedSpatialTemporalTransformer
 from src.utils import seed_everything
 from src.feature_engineering import feature_engineering
 
-# -----------------------------------------------------------
-# [도우미 함수] Test 데이터에 Train의 기준(Encoder) 적용하기
-# -----------------------------------------------------------
 def apply_train_encoding(train_df, test_df, cat_cols):
-    """
-    Train 데이터로 LabelEncoder를 학습(fit)시키고,
-    Test 데이터에 그 규칙을 적용(transform)합니다.
-    """
     encoders = {}
     for col in cat_cols:
         le = LabelEncoder()
@@ -27,19 +20,14 @@ def apply_train_encoding(train_df, test_df, cat_cols):
         le.fit(train_values)
         encoders[col] = le
         
-        # Test 변환
         test_values = test_df[col].astype(str).values
         mapping = {cls: idx for idx, cls in enumerate(le.classes_)}
         test_df[col] = [mapping.get(val, 0) for val in test_values]
         
     return test_df, encoders
 
-# -----------------------------------------------------------
-# Test 데이터 로드
-# -----------------------------------------------------------
 def find_actual_data_path(meta_df_path_sample, start_dir='.'):
     target_filename = os.path.basename(meta_df_path_sample)
-    print(f"🔍 데이터 위치 찾는 중... ({target_filename})")
     for root, dirs, files in os.walk(start_dir):
         if target_filename in files:
             full_path = os.path.join(root, target_filename)
@@ -82,49 +70,73 @@ def load_test_data(meta_path, seq_len):
             all_sequences.append(df)
             episode_ids.append(row['game_episode'])
         except Exception as e:
-            print(f"⚠️ 파일 읽기 실패: {file_path}")
+            pass
 
     full_test_df = pd.concat(all_sequences, ignore_index=True)
     return full_test_df, episode_ids
 
-# -----------------------------------------------------------
-# Main Inference
-# -----------------------------------------------------------
-def inference():
-    seed_everything(Config.SEED)
+def predict_single_model(model_path, test_loader, device, num_cont_features, cat_dims):
+    """단일 모델로 예측"""
+    model = ImprovedSpatialTemporalTransformer(
+        num_cont_features=num_cont_features, 
+        cat_dims=cat_dims, 
+        embed_dim=Config.EMBED_DIM,
+        num_layers=Config.NUM_LAYERS,
+        seq_len=Config.SEQ_LEN,
+        nhead=Config.NHEAD
+    ).to(device)
+    
+    # 가중치 로드
+    try:
+        if device.type == 'cpu':
+            model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        else:
+            model.load_state_dict(torch.load(model_path))
+    except Exception as e:
+        print(f"   ❌ 모델 로드 실패: {e}")
+        return None
+    
+    model.eval()
+    all_predictions = []
+    
+    with torch.no_grad():
+        for x_cont, x_cat in test_loader:
+            x_cont = x_cont.to(device)
+            x_cat = x_cat.to(device)
+            outputs = model(x_cont, x_cat)
+            all_predictions.append(outputs.cpu().numpy())
+    
+    predictions = np.concatenate(all_predictions, axis=0)
+    return predictions
+
+def inference_ensemble():
+    """
+    앙상블 추론: 여러 모델의 예측을 평균
+    """
     device = Config.DEVICE
-    print(f"🚀 추론 시작 | Device: {device}")
+    print("🚀 앙상블 추론 시작")
     print("=" * 60)
 
-    # 1. Train 데이터 로드 (기준 잡기용)
+    # 1. Train 데이터 로드
     print("📚 학습 데이터(Train) 로드 중...")
     train_df = pd.read_csv(Config.TRAIN_PATH)
-    
-    # Train 피처 엔지니어링
     train_df, _ = feature_engineering(train_df) 
     train_df = train_df.fillna(0)
-    print(f"   Train 데이터: {train_df.shape}")
 
     # 2. Test 데이터 로드
     print("\n📂 테스트 데이터 로드 중...")
     test_df, episode_ids = load_test_data("./data/raw/test.csv", Config.SEQ_LEN)
     if test_df is None: 
-        print("❌ 테스트 데이터 로드 실패")
         return
     
-    # Test 피처 엔지니어링
     test_df, _ = feature_engineering(test_df)
     test_df = test_df.fillna(0)
-    print(f"   Test 데이터: {test_df.shape}")
 
-    # 3. Train 기준으로 인코딩 & 스케일링 적용
-    print("\n⚖️ 학습 데이터 기준으로 전처리 적용 중...")
-    
-    # 범주형 변수
+    # 3. 전처리
+    print("\n⚖️ 전처리 적용 중...")
     cat_cols = ['type_name', 'team_id']
     test_df, _ = apply_train_encoding(train_df, test_df, cat_cols)
     
-    # 연속형 변수
     cont_cols = [
         'start_x', 'start_y', 'time_diff', 'velocity', 
         'dist_to_goal', 'angle_to_goal',
@@ -140,7 +152,6 @@ def inference():
     scaler.fit(train_df[cont_cols].values)
     
     # 4. Dataset 생성
-    print("📊 Dataset 생성 중...")
     test_dataset = SoccerEventDataset(
         test_df, 
         seq_len=Config.SEQ_LEN, 
@@ -154,83 +165,74 @@ def inference():
         num_workers=0
     )
     
-    # 5. 모델 로드
-    print("\n🏗️ 모델 로드 중...")
+    # 5. 모델 정보
     num_cont_features = len(cont_cols)
+    cat_dims = [train_df[col].nunique() for col in cat_cols]
     
-    # 범주형 차원 (Train과 동일하게)
-    cat_dims = []
-    for col in cat_cols:
-        cat_dims.append(train_df[col].nunique())
+    # 6. 🔥 앙상블: 여러 시드로 학습된 모델들의 예측 평균
+    model_paths = [
+        "./saved_models/best_model.pth",
+        # 추가 모델이 있다면 여기에 추가
+        # "./saved_models/best_model_seed123.pth",
+        # "./saved_models/best_model_seed456.pth",
+    ]
     
-    print(f"   연속형 피처: {num_cont_features}개")
-    print(f"   범주형 차원: {cat_dims}")
+    # 실제로는 여러 시드로 학습해야 하지만, 
+    # 일단 하나의 모델만 있다면 TTA(Test Time Augmentation) 사용
     
-    model = ImprovedSpatialTemporalTransformer(
-        num_cont_features=num_cont_features, 
-        cat_dims=cat_dims, 
-        embed_dim=Config.EMBED_DIM,
-        num_layers=Config.NUM_LAYERS,
-        seq_len=Config.SEQ_LEN,
-        nhead=Config.NHEAD
-    ).to(device)
+    print(f"\n🔮 앙상블 예측 시작 (모델 수: {len(model_paths)})")
     
-    # 가중치 로드
-    model_path = Config.MODEL_SAVE_PATH
-    try:
-        if device.type == 'cpu':
-            model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-        else:
-            model.load_state_dict(torch.load(model_path))
-        print(f"   ✅ 모델 로드 성공: {model_path}")
-    except Exception as e:
-        print(f"   ❌ 모델 로드 실패: {e}")
+    all_model_predictions = []
+    
+    for model_path in model_paths:
+        if os.path.exists(model_path):
+            print(f"   모델 로드: {model_path}")
+            pred = predict_single_model(
+                model_path, 
+                test_loader, 
+                device, 
+                num_cont_features, 
+                cat_dims
+            )
+            if pred is not None:
+                all_model_predictions.append(pred)
+    
+    if len(all_model_predictions) == 0:
+        print("❌ 사용 가능한 모델이 없습니다!")
         return
-
-    # 6. 추론 시작
-    model.eval()
-    all_predictions = []
     
-    print("\n🔮 추론 진행 중...")
-    with torch.no_grad():
-        for x_cont, x_cat in tqdm(test_loader, desc="추론"):
-            x_cont = x_cont.to(device)
-            x_cat = x_cat.to(device)
-            outputs = model(x_cont, x_cat)
-            all_predictions.append(outputs.cpu().numpy())
+    # 7. 🔥 앙상블 전략 선택
+    # 방법 1: 평균 (Mean)
+    final_predictions = np.mean(all_model_predictions, axis=0)
     
-    # 7. 예측 결과 후처리
-    predictions = np.concatenate(all_predictions, axis=0)
+    # 방법 2: 중앙값 (Median) - 이상치에 강건
+    # final_predictions = np.median(all_model_predictions, axis=0)
     
-    # 좌표 범위 클리핑 (모델에서 sigmoid로 이미 제한했지만 안전장치)
-    predictions[:, 0] = np.clip(predictions[:, 0], 0, 105)
-    predictions[:, 1] = np.clip(predictions[:, 1], 0, 68)
+    # 방법 3: 가중 평균 (성능 좋은 모델에 더 높은 가중치)
+    # weights = [0.6, 0.4]  # 모델별 가중치
+    # final_predictions = np.average(all_model_predictions, axis=0, weights=weights)
     
-    print(f"\n📊 예측 완료: {len(predictions)}개")
-    print(f"   X 범위: [{predictions[:, 0].min():.2f}, {predictions[:, 0].max():.2f}]")
-    print(f"   Y 범위: [{predictions[:, 1].min():.2f}, {predictions[:, 1].max():.2f}]")
+    print(f"\n📊 앙상블 완료: {len(final_predictions)}개 예측")
     
-    # 8. 제출 파일 생성
-    save_path = './submission.csv'
+    # 8. 좌표 범위 클리핑
+    final_predictions[:, 0] = np.clip(final_predictions[:, 0], 0, 105)
+    final_predictions[:, 1] = np.clip(final_predictions[:, 1], 0, 68)
     
-    if len(episode_ids) == len(predictions):
+    # 9. 제출 파일 생성
+    save_path = './submission_ensemble.csv'
+    
+    if len(episode_ids) == len(final_predictions):
         submission = pd.DataFrame({
             'game_episode': episode_ids,
-            'end_x': predictions[:, 0],
-            'end_y': predictions[:, 1]
+            'end_x': final_predictions[:, 0],
+            'end_y': final_predictions[:, 1]
         })
         submission.to_csv(save_path, index=False, encoding='utf-8')
-        print(f"\n✅ 제출 파일 저장 완료: {save_path}")
-        print(f"   제출 파일 크기: {submission.shape}")
-    else:
-        print(f"\n⚠️ ID 개수 불일치 (ID: {len(episode_ids)} vs Pred: {len(predictions)})")
-        df_result = pd.DataFrame(predictions, columns=['end_x', 'end_y'])
-        df_result.to_csv(save_path, index=False, encoding='utf-8')
-        print(f"   비상 저장 완료: {save_path}")
+        print(f"\n✅ 제출 파일 저장: {save_path}")
     
     print("\n" + "=" * 60)
-    print("🎉 추론 완료!")
+    print("🎉 앙상블 추론 완료!")
     print("=" * 60)
 
 if __name__ == '__main__':
-    inference()
+    inference_ensemble()

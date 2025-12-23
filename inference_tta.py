@@ -1,25 +1,40 @@
+"""
+Test Time Augmentation (TTA)
+추론 시 입력에 약간의 노이즈를 추가하여 여러 번 예측 후 평균
+"""
 import torch
 import pandas as pd
 import numpy as np
 import os
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 from src.config import Config
-from src.dataset import SoccerEventDataset
 from src.model import ImprovedSpatialTemporalTransformer
 from src.utils import seed_everything
 from src.feature_engineering import feature_engineering
 
-# -----------------------------------------------------------
-# [도우미 함수] Test 데이터에 Train의 기준(Encoder) 적용하기
-# -----------------------------------------------------------
+class TTADataset(Dataset):
+    """TTA를 위한 데이터셋 (노이즈 추가 가능)"""
+    def __init__(self, base_dataset, noise_std=0.3):
+        self.base_dataset = base_dataset
+        self.noise_std = noise_std
+    
+    def __len__(self):
+        return len(self.base_dataset)
+    
+    def __getitem__(self, idx):
+        x_cont, x_cat = self.base_dataset[idx]
+        
+        # 연속형 변수에 작은 노이즈 추가
+        if self.noise_std > 0:
+            noise = torch.randn_like(x_cont) * self.noise_std
+            x_cont = x_cont + noise
+        
+        return x_cont, x_cat
+
 def apply_train_encoding(train_df, test_df, cat_cols):
-    """
-    Train 데이터로 LabelEncoder를 학습(fit)시키고,
-    Test 데이터에 그 규칙을 적용(transform)합니다.
-    """
     encoders = {}
     for col in cat_cols:
         le = LabelEncoder()
@@ -27,19 +42,14 @@ def apply_train_encoding(train_df, test_df, cat_cols):
         le.fit(train_values)
         encoders[col] = le
         
-        # Test 변환
         test_values = test_df[col].astype(str).values
         mapping = {cls: idx for idx, cls in enumerate(le.classes_)}
         test_df[col] = [mapping.get(val, 0) for val in test_values]
         
     return test_df, encoders
 
-# -----------------------------------------------------------
-# Test 데이터 로드
-# -----------------------------------------------------------
 def find_actual_data_path(meta_df_path_sample, start_dir='.'):
     target_filename = os.path.basename(meta_df_path_sample)
-    print(f"🔍 데이터 위치 찾는 중... ({target_filename})")
     for root, dirs, files in os.walk(start_dir):
         if target_filename in files:
             full_path = os.path.join(root, target_filename)
@@ -52,7 +62,6 @@ def load_test_data(meta_path, seq_len):
     try:
         meta_df = pd.read_csv(meta_path)
     except:
-        print("❌ 메타 파일 로드 실패")
         return None, None
 
     first_path = meta_df.iloc[0]['path']
@@ -60,7 +69,6 @@ def load_test_data(meta_path, seq_len):
     if real_test_root is None: 
         return None, None
     
-    print(f"📂 데이터 경로: {real_test_root}")
     all_sequences = []
     episode_ids = [] 
     
@@ -81,50 +89,46 @@ def load_test_data(meta_path, seq_len):
             df['game_id'] = row['game_episode']
             all_sequences.append(df)
             episode_ids.append(row['game_episode'])
-        except Exception as e:
-            print(f"⚠️ 파일 읽기 실패: {file_path}")
+        except:
+            pass
 
     full_test_df = pd.concat(all_sequences, ignore_index=True)
     return full_test_df, episode_ids
 
-# -----------------------------------------------------------
-# Main Inference
-# -----------------------------------------------------------
-def inference():
+def inference_tta(n_tta=5, noise_std=0.3):
+    """
+    TTA 추론
+    
+    Args:
+        n_tta: TTA 반복 횟수 (5~10 추천)
+        noise_std: 노이즈 표준편차 (0.2~0.5 추천)
+    """
     seed_everything(Config.SEED)
     device = Config.DEVICE
-    print(f"🚀 추론 시작 | Device: {device}")
+    
+    print(f"🚀 TTA 추론 시작 (반복: {n_tta}회, 노이즈: {noise_std})")
     print("=" * 60)
 
-    # 1. Train 데이터 로드 (기준 잡기용)
-    print("📚 학습 데이터(Train) 로드 중...")
+    # 1. Train 데이터 로드
+    print("📚 학습 데이터 로드 중...")
     train_df = pd.read_csv(Config.TRAIN_PATH)
-    
-    # Train 피처 엔지니어링
     train_df, _ = feature_engineering(train_df) 
     train_df = train_df.fillna(0)
-    print(f"   Train 데이터: {train_df.shape}")
 
     # 2. Test 데이터 로드
     print("\n📂 테스트 데이터 로드 중...")
     test_df, episode_ids = load_test_data("./data/raw/test.csv", Config.SEQ_LEN)
     if test_df is None: 
-        print("❌ 테스트 데이터 로드 실패")
         return
     
-    # Test 피처 엔지니어링
     test_df, _ = feature_engineering(test_df)
     test_df = test_df.fillna(0)
-    print(f"   Test 데이터: {test_df.shape}")
 
-    # 3. Train 기준으로 인코딩 & 스케일링 적용
-    print("\n⚖️ 학습 데이터 기준으로 전처리 적용 중...")
-    
-    # 범주형 변수
+    # 3. 전처리
+    print("\n⚖️ 전처리 적용 중...")
     cat_cols = ['type_name', 'team_id']
     test_df, _ = apply_train_encoding(train_df, test_df, cat_cols)
     
-    # 연속형 변수
     cont_cols = [
         'start_x', 'start_y', 'time_diff', 'velocity', 
         'dist_to_goal', 'angle_to_goal',
@@ -139,32 +143,19 @@ def inference():
     scaler = StandardScaler()
     scaler.fit(train_df[cont_cols].values)
     
-    # 4. Dataset 생성
-    print("📊 Dataset 생성 중...")
-    test_dataset = SoccerEventDataset(
+    # 4. 기본 Dataset 생성
+    from src.dataset import SoccerEventDataset
+    base_dataset = SoccerEventDataset(
         test_df, 
         seq_len=Config.SEQ_LEN, 
         is_train=False, 
         scaler=scaler
     )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=Config.BATCH_SIZE, 
-        shuffle=False,
-        num_workers=0
-    )
     
     # 5. 모델 로드
     print("\n🏗️ 모델 로드 중...")
     num_cont_features = len(cont_cols)
-    
-    # 범주형 차원 (Train과 동일하게)
-    cat_dims = []
-    for col in cat_cols:
-        cat_dims.append(train_df[col].nunique())
-    
-    print(f"   연속형 피처: {num_cont_features}개")
-    print(f"   범주형 차원: {cat_dims}")
+    cat_dims = [train_df[col].nunique() for col in cat_cols]
     
     model = ImprovedSpatialTemporalTransformer(
         num_cont_features=num_cont_features, 
@@ -175,62 +166,77 @@ def inference():
         nhead=Config.NHEAD
     ).to(device)
     
-    # 가중치 로드
     model_path = Config.MODEL_SAVE_PATH
     try:
         if device.type == 'cpu':
             model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         else:
             model.load_state_dict(torch.load(model_path))
-        print(f"   ✅ 모델 로드 성공: {model_path}")
+        print(f"   ✅ 모델 로드 성공")
     except Exception as e:
         print(f"   ❌ 모델 로드 실패: {e}")
         return
 
-    # 6. 추론 시작
     model.eval()
-    all_predictions = []
     
-    print("\n🔮 추론 진행 중...")
-    with torch.no_grad():
-        for x_cont, x_cat in tqdm(test_loader, desc="추론"):
-            x_cont = x_cont.to(device)
-            x_cat = x_cat.to(device)
-            outputs = model(x_cont, x_cat)
-            all_predictions.append(outputs.cpu().numpy())
+    # 6. 🔥 TTA 추론
+    print(f"\n🔮 TTA 추론 시작 ({n_tta}회 반복)...")
+    all_tta_predictions = []
     
-    # 7. 예측 결과 후처리
-    predictions = np.concatenate(all_predictions, axis=0)
+    for tta_idx in range(n_tta):
+        print(f"   TTA {tta_idx+1}/{n_tta}...")
+        
+        # TTA Dataset 생성 (첫 번째는 원본, 나머지는 노이즈 추가)
+        if tta_idx == 0:
+            tta_dataset = TTADataset(base_dataset, noise_std=0)  # 원본
+        else:
+            tta_dataset = TTADataset(base_dataset, noise_std=noise_std)
+        
+        tta_loader = DataLoader(
+            tta_dataset, 
+            batch_size=Config.BATCH_SIZE, 
+            shuffle=False,
+            num_workers=0
+        )
+        
+        # 추론
+        predictions = []
+        with torch.no_grad():
+            for x_cont, x_cat in tta_loader:
+                x_cont = x_cont.to(device)
+                x_cat = x_cat.to(device)
+                outputs = model(x_cont, x_cat)
+                predictions.append(outputs.cpu().numpy())
+        
+        predictions = np.concatenate(predictions, axis=0)
+        all_tta_predictions.append(predictions)
     
-    # 좌표 범위 클리핑 (모델에서 sigmoid로 이미 제한했지만 안전장치)
-    predictions[:, 0] = np.clip(predictions[:, 0], 0, 105)
-    predictions[:, 1] = np.clip(predictions[:, 1], 0, 68)
+    # 7. TTA 결과 평균
+    final_predictions = np.mean(all_tta_predictions, axis=0)
     
-    print(f"\n📊 예측 완료: {len(predictions)}개")
-    print(f"   X 범위: [{predictions[:, 0].min():.2f}, {predictions[:, 0].max():.2f}]")
-    print(f"   Y 범위: [{predictions[:, 1].min():.2f}, {predictions[:, 1].max():.2f}]")
+    print(f"\n📊 TTA 완료")
+    print(f"   예측 개수: {len(final_predictions)}")
     
-    # 8. 제출 파일 생성
-    save_path = './submission.csv'
+    # 8. 좌표 범위 클리핑
+    final_predictions[:, 0] = np.clip(final_predictions[:, 0], 0, 105)
+    final_predictions[:, 1] = np.clip(final_predictions[:, 1], 0, 68)
     
-    if len(episode_ids) == len(predictions):
+    # 9. 제출 파일 생성
+    save_path = './submission_tta.csv'
+    
+    if len(episode_ids) == len(final_predictions):
         submission = pd.DataFrame({
             'game_episode': episode_ids,
-            'end_x': predictions[:, 0],
-            'end_y': predictions[:, 1]
+            'end_x': final_predictions[:, 0],
+            'end_y': final_predictions[:, 1]
         })
         submission.to_csv(save_path, index=False, encoding='utf-8')
-        print(f"\n✅ 제출 파일 저장 완료: {save_path}")
-        print(f"   제출 파일 크기: {submission.shape}")
-    else:
-        print(f"\n⚠️ ID 개수 불일치 (ID: {len(episode_ids)} vs Pred: {len(predictions)})")
-        df_result = pd.DataFrame(predictions, columns=['end_x', 'end_y'])
-        df_result.to_csv(save_path, index=False, encoding='utf-8')
-        print(f"   비상 저장 완료: {save_path}")
+        print(f"\n✅ 제출 파일 저장: {save_path}")
     
     print("\n" + "=" * 60)
-    print("🎉 추론 완료!")
+    print("🎉 TTA 추론 완료!")
     print("=" * 60)
 
 if __name__ == '__main__':
-    inference()
+    # TTA 파라미터 조정 가능
+    inference_tta(n_tta=5, noise_std=0.3)
